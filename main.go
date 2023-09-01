@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"path/filepath"
 )
 
 var (
@@ -32,6 +33,10 @@ var (
 	horizontal     = flag.Bool("horizontal", false, "lay out the dependency graph horizontally instead of vertically")
 	withTests      = flag.Bool("withtests", false, "include test packages")
 	maxLevel       = flag.Int("maxlevel", 256, "max level of go dependency graph")
+	cwd			   = flag.String("cwd","","current work dir")
+	recursive	   = flag.Bool("recursively",false, "search for .mod files recursively")
+	verbose 	   = flag.Bool("verbose",false, "verbose output")
+	output 	       = flag.String("output","output.dg", "output file name")
 
 	buildTags    []string
 	buildContext = build.Default
@@ -45,6 +50,10 @@ func init() {
 	flag.BoolVar(withTests, "t", false, "(alias for -withtests) include test packages")
 	flag.IntVar(maxLevel, "l", 256, "(alias for -maxlevel) maximum level of the go dependency graph")
 	flag.BoolVar(withGoroot, "d", false, "(alias for -withgoroot) show dependencies of packages in the Go standard library")
+	flag.StringVar(cwd, "c", "", "(alias for -cwd) set current work dir")
+	flag.BoolVar(recursive, "r", false, "(alias for -recursively) search for .mod files recursively")
+	flag.BoolVar(verbose, "v", false, "(alias for -verbose) verbose output")
+	flag.StringVar(output, "f", "output.dg", "(alias for -output) output file")
 }
 
 func main() {
@@ -75,21 +84,72 @@ func main() {
 	}
 	buildContext.BuildTags = buildTags
 
-	cwd, err := os.Getwd()
+
+	default_dir, err := os.Getwd()
 	if err != nil {
 		log.Fatalf("failed to get cwd: %s", err)
 	}
-	for _, a := range args {
-		if err := processPackage(cwd, a, 0, "", *stopOnError); err != nil {
-			log.Fatal(err)
+	
+
+	if len(*cwd) == 0 {
+		*cwd, err = os.Getwd()
+		if err != nil {
+			log.Fatalf("failed to get cwd: %s", err)
 		}
+	}else{
+		os.Chdir(*cwd)
 	}
 
-	fmt.Println("digraph godep {")
-	if *horizontal {
-		fmt.Println(`rankdir="LR"`)
+	var root_paths = make(map[string]string)
+
+	if *recursive {
+
+	    _ = filepath.Walk(*cwd, func(path string, file os.FileInfo, err error) error {
+
+	        if err != nil {
+	            fmt.Println(err)
+	            return nil
+	        }
+	        dir:=filepath.Dir(path)
+	        for p,_ := range root_paths{
+	        	if strings.Contains(dir, p) {
+//	        		log.Printf("Already has %s, skipping %s",p, path)
+	        		return nil
+	        	}
+	        }
+
+	        if !file.IsDir() && filepath.Base(path) == "go.mod"{
+	        	root_paths[filepath.Dir(path)] = filepath.Join(*cwd,path)
+				debugf("Found mod.file in path %s", path)
+	        }
+
+	        return nil
+    	})
+	}else{
+		root_paths[*cwd]=filepath.Join(*cwd,"go.mod")
 	}
-	fmt.Print(`splines=ortho
+
+	for mod_path, _ := range root_paths {
+		debugf("Entering %s",mod_path)
+		os.Chdir(mod_path)
+		for _, a := range args {
+			if err := processPackage(mod_path, a, 0, "", *stopOnError); err != nil {
+				log.Fatal(err)
+			}
+		}
+		debugf("Leaving %s",mod_path)		
+	}
+
+    f, err := os.Create(filepath.Join(default_dir,*output))
+    defer f.Close()
+
+	// fmt.Println("digraph godep {")
+	f.WriteString("digraph godep {")
+	if *horizontal {
+		// fmt.Println(`rankdir="LR"`)
+		f.WriteString(`rankdir="LR"`)
+	}
+	f.WriteString(`splines=ortho
 nodesep=0.4
 ranksep=0.8
 node [shape="box",style="rounded,filled"]
@@ -102,6 +162,7 @@ edge [arrowsize="0.5"]
 		pkgKeys = append(pkgKeys, k)
 	}
 	sort.Strings(pkgKeys)
+	// fmt.Println("%v",pkgKeys)
 
 	for _, pkgName := range pkgKeys {
 		pkg := pkgs[pkgName]
@@ -111,12 +172,15 @@ edge [arrowsize="0.5"]
 			continue
 		}
 
+
 		var color string
 		switch {
+		case strings.Contains(pkgName,"solidwall.io"):
+			color = "yellow"
 		case pkg.Goroot:
 			color = "palegreen"
 		case len(pkg.CgoFiles) > 0:
-			color = "darkgoldenrod1"
+			color = "darkgoldenrod"
 		case isVendored(pkg.ImportPath):
 			color = "palegoldenrod"
 		case hasBuildErrors(pkg):
@@ -125,7 +189,9 @@ edge [arrowsize="0.5"]
 			color = "paleturquoise"
 		}
 
-		fmt.Printf("%s [label=\"%s\" color=\"%s\" URL=\"%s\" target=\"_blank\"];\n", pkgId, pkgName, color, pkgDocsURL(pkgName))
+
+		f.WriteString(fmt.Sprintf("%s [label=\"%s\" color=\"%s\" URL=\"%s\" target=\"_blank\"];\n", pkgId, pkgName, color, pkgDocsURL(pkgName)))
+
 
 		// Don't render imports from packages in Goroot
 		if pkg.Goroot && !*withGoroot {
@@ -139,14 +205,14 @@ edge [arrowsize="0.5"]
 			}
 
 			impId := getId(imp)
-			fmt.Printf("%s -> %s;\n", pkgId, impId)
+			f.WriteString(fmt.Sprintf("%s -> %s;\n", pkgId, impId))
 		}
 	}
-	fmt.Println("}")
+	f.WriteString("}")
 }
 
 func pkgDocsURL(pkgName string) string {
-	return "https://godoc.org/" + pkgName
+	return pkgName
 }
 
 func processPackage(root string, pkgName string, level int, importedBy string, stopOnError bool) error {
@@ -157,6 +223,7 @@ func processPackage(root string, pkgName string, level int, importedBy string, s
 		return nil
 	}
 
+	debugf("Importing %s in %s\n", pkgName, root)
 	pkg, buildErr := buildContext.Import(pkgName, root, 0)
 	if buildErr != nil {
 		if stopOnError {
@@ -229,6 +296,7 @@ func getId(name string) string {
 
 func hasPrefixes(s string, prefixes []string) bool {
 	for _, p := range prefixes {
+		// debugf("%s has prefix %s ?",s,p)
 		if strings.HasPrefix(s, p) {
 			return true
 		}
@@ -264,7 +332,10 @@ func debug(args ...interface{}) {
 }
 
 func debugf(s string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, s, args...)
+	if(*verbose){
+		fmt.Println(fmt.Sprintf(s, args...))
+	}
+
 }
 
 func isVendored(path string) bool {
